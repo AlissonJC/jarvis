@@ -85,6 +85,23 @@ export function blockedAddress(ip) {
   // The hex forms the parser actually produces, including the mapped range that
   // the dotted-quad unwrap above can never see.
   if (addr === '::' || addr === '::1') return true
+  // Ranges that carry an IPv4 address inside an IPv6 one. A gateway or tunnel
+  // delivers the packet to the embedded address, so that is the address to judge:
+  // 64:ff9b::7f00:1 (NAT64) and 2002:7f00:1:: (6to4) both reach 127.0.0.1.
+  const groups = expandV6(addr)
+  if (groups) {
+    const v4 = (hi, lo) => [hi >> 8, hi & 0xff, lo >> 8, lo & 0xff].join('.')
+    const zeros = (from, to) => groups.slice(from, to).every((g) => g === 0)
+    if (groups[0] === 0x64 && groups[1] === 0xff9b) {
+      // 64:ff9b::/96 maps the whole IPv4 space; 64:ff9b:1::/48 is local-use.
+      return groups[2] === 1 || !zeros(2, 6) ? true : blockedAddress(v4(groups[6], groups[7]))
+    }
+    if (groups[0] === 0x2002) return blockedAddress(v4(groups[1], groups[2]))
+    if (groups[0] === 0x2001 && groups[1] === 0) return true // Teredo tunnels
+    if (zeros(0, 6)) return blockedAddress(v4(groups[6], groups[7])) // ::a.b.c.d, the deprecated IPv4-compatible form
+    if (groups[0] === 0x100 && zeros(1, 4)) return true // 100::/64, discard-only
+    if ((groups[0] & 0xffc0) === 0xfec0) return true // fec0::/10, site-local
+  }
   if (/^::ffff:/.test(addr)) {
     const hex = addr.slice(7).split(':')
     if (hex.length === 2) {
@@ -102,6 +119,27 @@ export function blockedAddress(ip) {
   if (/^fe[89ab]/.test(addr)) return true // fe80::/10 link-local
   if (/^ff/.test(addr)) return true // multicast
   return false
+}
+
+/** An IPv6 literal as eight 16-bit numbers, or null if it is not one. Understands `::` and a trailing dotted quad. */
+function expandV6(addr) {
+  if (!addr.includes(':')) return null
+  let text = addr
+  const tail = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(text)
+  if (tail) {
+    const q = tail[2].split('.').map(Number)
+    if (q.some((n) => n > 255)) return null
+    text = `${tail[1]}${((q[0] << 8) | q[1]).toString(16)}:${((q[2] << 8) | q[3]).toString(16)}`
+  }
+  const halves = text.split('::')
+  if (halves.length > 2) return null
+  const head = halves[0] ? halves[0].split(':') : []
+  const rest = halves.length === 2 && halves[1] ? halves[1].split(':') : []
+  const fill = 8 - head.length - rest.length
+  if (halves.length === 1 ? head.length !== 8 : fill < 0) return null
+  const all = halves.length === 1 ? head : [...head, ...Array(fill).fill('0'), ...rest]
+  const groups = all.map((g) => (/^[0-9a-f]{1,4}$/.test(g) ? parseInt(g, 16) : NaN))
+  return groups.some(Number.isNaN) ? null : groups
 }
 
 /**
@@ -158,7 +196,8 @@ export function vetTarget(raw) {
     throw proxyError(400, 'absolute http(s) url required')
   }
   if (!url.hostname) throw proxyError(400, 'absolute http(s) url required')
-  if (BLOCKED_HOSTNAME.test(url.hostname)) throw proxyError(403, 'blocked host')
+  // `localhost.` (a trailing dot) is the same name; the dot must not hide it.
+  if (BLOCKED_HOSTNAME.test(url.hostname.replace(/\.+$/, ''))) throw proxyError(403, 'blocked host')
   // An IP literal never reaches DNS in any meaningful sense, so judge it here —
   // this is what turns http://127.0.0.1:8787/health into a refusal before a
   // socket is opened rather than after.
@@ -213,10 +252,10 @@ export function requestOnce(url, headers, timeoutMs) {
  * http://169.254.169.254/ is the whole SSRF attack, and a redirect to
  * file:// or data: is the other half of it.
  */
-export async function openRemote(startUrl, headers, timeoutMs) {
+export async function openRemote(startUrl, headers, timeoutMs, { checkHop, request = requestOnce } = {}) {
   let url = startUrl
   for (let hop = 0; ; hop++) {
-    const res = await requestOnce(url, headers, timeoutMs)
+    const res = await request(url, headers, timeoutMs)
     const status = res.statusCode ?? 0
     const location = res.headers.location
     if (status >= 300 && status < 400 && location) {
@@ -231,6 +270,11 @@ export async function openRemote(startUrl, headers, timeoutMs) {
       // vetTarget re-runs the scheme and host checks; guardedLookup re-runs the
       // address check when the next hop connects.
       url = vetTarget(next.href)
+      // Where the server sends the request on is the server's choice, not ours, so
+      // the egress rule (egress.mjs) is asked again for every hop: an address that
+      // passed because its host is trusted can still be an open redirector.
+      const refused = checkHop?.(url)
+      if (refused) throw proxyError(403, 'redirect not allowed')
       continue
     }
     return { res, url }
@@ -245,7 +289,7 @@ export async function openRemote(startUrl, headers, timeoutMs) {
  * the cap is one we should decline rather than truncate — half an HTML document
  * parses into something arbitrary.
  */
-export async function fetchText(url, { maxBytes, timeoutMs, accept }) {
+export async function fetchText(url, { maxBytes, timeoutMs, accept, checkHop }) {
   const target = vetTarget(url)
   const { res, url: finalUrl } = await openRemote(
     target,
@@ -256,6 +300,7 @@ export async function fetchText(url, { maxBytes, timeoutMs, accept }) {
       'accept-encoding': 'identity',
     },
     timeoutMs,
+    { checkHop },
   )
 
   const status = res.statusCode ?? 0
@@ -305,12 +350,13 @@ export async function fetchText(url, { maxBytes, timeoutMs, accept }) {
  * what a real GET would return, and being wrong about the content type is the
  * entire failure this is here to prevent.
  */
-export async function peek(url, { timeoutMs }) {
+export async function peek(url, { timeoutMs, checkHop }) {
   const target = vetTarget(url)
   const { res, url: finalUrl } = await openRemote(
     target,
     { 'user-agent': PROXY_UA, accept: '*/*', 'accept-encoding': 'identity' },
     timeoutMs,
+    { checkHop },
   )
   const out = {
     status: res.statusCode ?? 0,

@@ -1,6 +1,7 @@
 import type { AskHandlers } from './anthropic'
 import type { Blade, Panel } from '../store'
-import { BRIDGE_WS_URL } from '../config'
+import { BRIDGE_TOKEN, BRIDGE_WS_URL } from '../config'
+import { parseAnnouncement, type Announcement } from './announce'
 
 /**
  * Client for the local bridge (see bridge/server.mjs).
@@ -35,6 +36,11 @@ type Frame = {
   seconds?: number
   when?: string
   servers?: Array<string | { name?: string }>
+  priority?: string
+  source?: string
+  kind?: string
+  at?: number
+  expiresAt?: number
 }
 
 /** Every question gets an id so its answer can be told from anyone else's. */
@@ -101,14 +107,53 @@ export function watchUi(fn: (op: string, args: any) => void) {
 }
 
 /**
+ * The assistant speaking first. The bridge pushes an `announce` frame when it
+ * has something for the user (a reminder, the morning briefing, a local script);
+ * the page decides when to speak it, asks leave with `announce_play` (the bridge
+ * refuses while a confirmation is pending or a turn is running), and reports how
+ * it went with `announce_ack`.
+ */
+let onAnnounce: ((a: Announcement) => void) | null = null
+export function watchAnnounce(fn: (a: Announcement) => void) {
+  onAnnounce = fn
+}
+
+/** Waiting for the bridge's answer to announce_play, by id. */
+const playAsks = new Map<string, (go: boolean) => void>()
+
+/** Ask leave to start speaking `id`. False on a refusal, a lost socket or silence. */
+export function requestAnnouncePlay(id: string, timeoutMs = 3000): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (socket?.readyState !== WebSocket.OPEN) return resolve(false)
+    const timer = window.setTimeout(() => {
+      playAsks.delete(id)
+      resolve(false)
+    }, timeoutMs)
+    playAsks.set(id, (go) => {
+      clearTimeout(timer)
+      playAsks.delete(id)
+      resolve(go)
+    })
+    socket.send(JSON.stringify({ type: 'announce_play', id }))
+  })
+}
+
+/** Tell the bridge how an announcement ended: spoken in full, or cut off. */
+export function ackAnnounce(id: string, status: 'played' | 'interrupted') {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'announce_ack', id, status }))
+}
+
+/**
  * Connection state, for the UI.
  *
  *   'open'        — first connection of the page.
  *   'lost'        — the socket died. The agent session died with it, so
  *                   everything said so far is gone as far as JARVIS knows.
  *   'reconnected' — we're back, on a fresh session with no memory of the above.
+ *   'renewed'     — the user asked for a new conversation (`newConversation`) and
+ *                   this is the fresh session: expected, nothing was lost by accident.
  */
-export type ConnectionState = 'open' | 'lost' | 'reconnected'
+export type ConnectionState = 'open' | 'lost' | 'reconnected' | 'renewed'
 let onConnection: ((state: ConnectionState) => void) | null = null
 export function watchConnection(fn: (state: ConnectionState) => void) {
   onConnection = fn
@@ -135,6 +180,9 @@ function deferred() {
 let firstReady = deferred()
 
 let everConnected = false
+
+/** The user asked for a new conversation and the bridge is about to close this socket on purpose. */
+let renewing = false
 
 /** Backoff for the automatic re-dial. It gives up after the last delay rather
  *  than retrying forever — a bridge that has been down for half a minute is
@@ -203,6 +251,11 @@ function dispatch(ws: WebSocket) {
           .then(reply)
           .catch((err) => reply({ error: String(err?.message ?? err) }))
       }
+    } else if (msg.type === 'announce') {
+      const item = parseAnnouncement(msg)
+      if (item) onAnnounce?.(item)
+    } else if ((msg.type === 'announce_go' || msg.type === 'announce_hold') && msg.id) {
+      playAsks.get(msg.id)?.(msg.type === 'announce_go')
     } else if (msg.type === 'ui' && msg.op) {
       // A `ui` frame with no args is normal — reset and clear take none — so an
       // absent args object is an empty one, not a reason to drop the command.
@@ -218,7 +271,12 @@ function connect(): Promise<WebSocket> {
   firstReady = deferred()
 
   connecting = new Promise<WebSocket>((resolve, reject) => {
-    const ws = new WebSocket(BRIDGE_WS_URL)
+    // Browsers cannot set headers on a handshake, so the token rides as a second
+    // subprotocol; the bridge answers with the plain one only.
+    const ws = new WebSocket(
+      BRIDGE_WS_URL,
+      BRIDGE_TOKEN ? ['jarvis.v1', `jarvis.token.${BRIDGE_TOKEN}`] : ['jarvis.v1'],
+    )
     let settled = false
 
     /**
@@ -246,7 +304,8 @@ function connect(): Promise<WebSocket> {
       attempt = 0
       dispatch(ws)
       settle(null)
-      onConnection?.(everConnected ? 'reconnected' : 'open')
+      onConnection?.(renewing ? 'renewed' : everConnected ? 'reconnected' : 'open')
+      renewing = false
       everConnected = true
     }
     ws.onerror = () => {
@@ -267,8 +326,8 @@ function connect(): Promise<WebSocket> {
         new Error(
           `Cannot reach the bridge at ${BRIDGE_WS_URL}. Either it is not ` +
             'running (start it with `npm start`), or this page is on a port it ' +
-            `refuses — it accepts localhost:5173-5199 and 4173-4199, and this ` +
-            `page is on ${location.port || '80'}.`,
+            `refuses — it accepts the face only from the one origin \`npm start\` named ` +
+            `(5173 or 4173 when the bridge runs alone), and this page is on ${location.port || '80'}.`,
         ),
       )
     }
@@ -278,8 +337,14 @@ function connect(): Promise<WebSocket> {
       settle(new Error('The bridge closed the connection.'))
       if (socket === ws) {
         socket = null
-        onConnection?.('lost')
-        scheduleReconnect()
+        if (renewing) {
+          // On purpose: dial at once, the session behind this socket is already gone.
+          attempt = 0
+          void connect().catch(() => scheduleReconnect())
+        } else {
+          onConnection?.('lost')
+          scheduleReconnect()
+        }
       }
     }
   })
@@ -493,6 +558,24 @@ export function cancel(): void {
 /** The older name for `cancel()`. */
 export function interrupt(): void {
   cancel()
+}
+
+/**
+ * Start a new conversation, on the user's say-so (a spoken "nova conversa" or the
+ * N key; the callers check that it is really them). The bridge ends the session
+ * behind this socket, with what it remembers of the exchange and what it has read,
+ * and closes the socket; the page dials again at once and gets a clean one. Never
+ * called from anything the model produced: it is not reachable from a tool.
+ */
+export function newConversation(): void {
+  cancel()
+  if (socket?.readyState !== WebSocket.OPEN) return // no session to end: the next dial is a new one
+  renewing = true
+  // A bridge that did not close the socket (an older build) must not leave the flag standing.
+  window.setTimeout(() => {
+    renewing = false
+  }, 8000)
+  socket.send(JSON.stringify({ type: 'new_conversation' }))
 }
 
 /** `mcp__higgsfield__generate_image` -> `higgsfield · generate image` */

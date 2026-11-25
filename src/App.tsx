@@ -11,6 +11,7 @@ import * as sfx from './lib/sfx'
 import * as music from './lib/music'
 import * as hands from './lib/hands'
 import { listenForClap } from './lib/clap'
+import { startClapWake, type ClapWake } from './lib/clapwake'
 import * as camera from './lib/camera'
 import * as kokoro from './lib/kokoro'
 import { TTS_ENGINE } from './config'
@@ -25,13 +26,20 @@ import {
   watchCapture,
   watchUi,
   watchConnection,
+  watchAnnounce,
+  requestAnnouncePlay,
+  ackAnnounce,
+  newConversation,
   connectedLabels,
   usingBridge,
   type Msg,
 } from './lib/brain'
 import { startAnalyser, micLevel } from './lib/audio'
+import { announceBlade, canPlayNow, createAnnounceInbox, type Announcement } from './lib/announce'
 import { probeCapabilities } from './lib/capabilities'
 import { env } from './config'
+import { BARE_NAME, LEADING_NAME } from './lib/identity'
+import { isNewConversation } from './lib/commands'
 
 /**
  * The conversation.
@@ -61,13 +69,11 @@ const newId = () =>
   globalThis.crypto?.randomUUID?.() ??
   `id${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
 
-/** The same mishearings voice.ts accepts for the wake word — otherwise a turn
- *  that woke him as "travis" gets that word sent on to the model as a question. */
-const NAME = '(?:jarvis|jarvys|jervis|travis|jarviss|java\'s|jarv)'
-/** A bare vocative — "Jarvis", "hey jarvis" — with nothing asked. */
-const BARE_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}[\\s,.!?]*$`, 'i')
-/** A leading vocative on a real command: "Jarvis, what's the weather". */
-const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-]*`, 'i')
+// BARE_NAME (a vocative with nothing asked: "Jarvis", "ei Jarvis") and
+// LEADING_NAME (a vocative on a real command: "Jarvis, que horas são") share the
+// spellings voice.ts accepts for the wake word — otherwise a turn that woke him
+// as "jarves" gets that word sent on to the model as a question. They are built
+// in identity.ts from VITE_ASSISTANT_NAME / VITE_WAKE_WORDS.
 
 export default function App() {
   const store = useStore
@@ -75,6 +81,7 @@ export default function App() {
   const history = useRef<Msg[]>([])
   const speaker = useRef<ReturnType<typeof createSpeaker> | null>(null)
   const voice = useRef<Voice | null>(null)
+  const clapWake = useRef<ClapWake | null>(null)
 
   /**
    * Monotonic turn counter. Every await in a turn checks it on the way out:
@@ -85,6 +92,10 @@ export default function App() {
   const booting = useRef(false)
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
+  /** Announcements (reminders, the briefing, local scripts) waiting for a quiet moment to be spoken. */
+  const inbox = useRef(createAnnounceInbox())
+  const announcing = useRef(false)
+  const announcePoll = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // -- helpers --------------------------------------------------------------
 
@@ -218,6 +229,109 @@ export default function App() {
     }
   }
 
+  // -- the assistant speaking first -----------------------------------------
+
+  /**
+   * Speak one announcement through the same speaker an answer uses, so the echo
+   * filter, the clap mute and the barge-in treat it exactly like speech. The
+   * bridge is asked first and may refuse (a confirmation is pending, or a turn
+   * is running); nothing the announcement says is ever sent to the model.
+   * Reports back how it went, so the bridge can drop it or try again later.
+   */
+  const playAnnouncement = async (item: Announcement): Promise<void> => {
+    if (!(await requestAnnouncePlay(item.id))) return
+    // The world may have moved while the bridge was answering.
+    const now = store.getState()
+    if (now.phase !== 'dormant' && now.phase !== 'listening') return
+
+    const mine = ++turn.current
+    const stale = () => mine !== turn.current
+    clearIdle()
+    const s = store.getState()
+    s.setCaption('')
+    const card = announceBlade(item)
+    s.pushBlade(card)
+    window.setTimeout(() => store.getState().closeBlade(card.id), 60_000)
+    s.pushTurn({ id: newId(), role: 'jarvis', text: item.text })
+    s.setPhase('speaking')
+
+    const spk = createSpeaker()
+    speaker.current = spk
+    sfx.duck(true)
+    music.duck(true)
+    let status: 'played' | 'interrupted' = 'played'
+    try {
+      spk.push(item.text)
+      await spk.end()
+      if (stale()) status = 'interrupted'
+    } catch (err) {
+      console.error(err)
+      status = 'interrupted'
+    } finally {
+      if (!stale()) {
+        speaker.current = null
+        sfx.duck(false)
+        music.duck(false)
+        // Back to rest: the wake word, not an open microphone, starts what comes next.
+        store.getState().setPhase('dormant')
+      }
+    }
+    if (status === 'played') inbox.current.done(item.id)
+    else inbox.current.release(item.id)
+    ackAnnounce(item.id, status)
+  }
+
+  const pumpAnnouncements = () => {
+    if (announcing.current) return
+    const next = inbox.current.next()
+    if (!next) return
+    const st = store.getState()
+    const ok = canPlayNow({
+      phase: st.phase,
+      caption: st.caption,
+      priority: next.item.priority,
+      waitedMs: next.waitedMs,
+      micLoud: micLevel() > 0.35,
+    })
+    if (!ok) return
+    announcing.current = true
+    void playAnnouncement(next.item).finally(() => {
+      announcing.current = false
+    })
+  }
+
+  // -- a new conversation ---------------------------------------------------
+
+  /**
+   * Start over: the bridge drops its session (what it remembers, what it has read
+   * and the caution that comes with that), the screen is cleared and the next
+   * thing said begins a fresh exchange. Only the user's own utterance or a real
+   * keypress gets here (isNewConversation on the transcript of the microphone,
+   * the N key with `isTrusted`); nothing the model says or shows can, because
+   * nothing in this file calls it from a model's output (docs/SEGURANCA.md, O1).
+   */
+  const startNewConversation = () => {
+    clearIdle()
+    silence()
+    turn.current++
+    history.current = []
+    music.working(false)
+    sfx.duck(false)
+    music.duck(false)
+    newConversation()
+    const s = store.getState()
+    s.clearScreen('all')
+    s.setError(null)
+    s.setPhase('waking')
+    const line = 'Conversa nova, senhor.'
+    s.pushTurn({ id: newId(), role: 'jarvis', text: line })
+    const spk = createSpeaker()
+    speaker.current = spk
+    spk.say(line)
+    void spk.end()
+    listen(AWAIT_SPEECH_MS)
+  }
+
   // -- voice events ---------------------------------------------------------
 
   /** What the voice loop should do with what it hears, derived from phase. */
@@ -246,7 +360,8 @@ export default function App() {
     // "Jarvis, what's happening in AI this week" in one breath. Waiting for a
     // greeting he didn't need is the most common way an assistant wastes time.
     if (trailing) {
-      void respond(trailing)
+      if (isNewConversation(trailing)) startNewConversation()
+      else void respond(trailing)
       return
     }
 
@@ -280,7 +395,8 @@ export default function App() {
       // Abandon the answer in flight. The turn counter moves in respond()'s
       // replacement; bumping it here covers the case where nothing replaces it.
       turn.current++
-      interrupt()
+      // An announcement is not a turn of the model: there is nothing to cancel there.
+      if (!announcing.current) interrupt()
       store.getState().setActiveTool(null)
       music.working(false)
       sfx.duck(false)
@@ -302,6 +418,11 @@ export default function App() {
     const said = text.replace(LEADING_NAME, '').trim()
     if (!said) {
       listen(AWAIT_SPEECH_MS)
+      return
+    }
+
+    if (isNewConversation(said)) {
+      startNewConversation()
       return
     }
 
@@ -364,6 +485,9 @@ export default function App() {
     watchServers((servers) => store.getState().setConnected(servers))
     watchPanels((panel) => store.getState().pushPanel(panel))
     watchBlades((blade) => store.getState().pushBlade(blade))
+    watchAnnounce((a) => {
+      inbox.current.add(a)
+    })
 
     /**
      * JARVIS asking to see something.
@@ -460,6 +584,8 @@ export default function App() {
           .getState()
           .setError('Bridge reconnected. The previous conversation was not kept.')
       }
+      // 'renewed' is the new conversation the user asked for: nothing to report.
+
     })
     const warming = warm().catch((err: Error) => s.setError(err.message))
 
@@ -527,6 +653,17 @@ export default function App() {
     })
 
     store.getState().setPhase('dormant')
+    announcePoll.current = setInterval(pumpAnnouncements, 750)
+
+    // Double clap or double snap wakes him like his name does. Not awaited: the
+    // sound model is ~26 MB of WASM and weights, and the voice wake word works
+    // from the first second regardless. Only counts while he is dormant.
+    void startClapWake({
+      active: () => store.getState().phase === 'dormant',
+      onWake: () => onWake(''),
+    }).then((w) => {
+      clapWake.current = w
+    })
   }
 
   // -- clap to start --------------------------------------------------------
@@ -598,7 +735,7 @@ export default function App() {
         silence()
         const demo = createSpeaker()
         speaker.current = demo
-        demo.say(`Voice set to ${name.replace(/\(.*?\)/g, '').trim()}. At your service, sir.`)
+        demo.say(`Voz definida: ${name.replace(/\(.*?\)/g, '').trim()}. Às suas ordens, senhor.`)
         void demo.end()
         return
       }
@@ -640,7 +777,7 @@ export default function App() {
         silence()
         const t = createSpeaker()
         speaker.current = t
-        t.say('Audio test. If you can hear this, speech output is working, sir.')
+        t.say('Teste de áudio. Se o senhor está ouvindo isto, a fala está funcionando.')
         void t.end().then(() => {
           const d = (window as unknown as Record<string, Record<string, unknown>>).__tts
           console.info('[jarvis] audio test →', d)
@@ -650,6 +787,17 @@ export default function App() {
             )
           }
         })
+        return
+      }
+
+      // N starts a new conversation: the same as saying "nova conversa". Only a
+      // key the user pressed (a script on the page cannot dispatch a trusted event).
+      if (e.key === 'n' && e.isTrusted && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        const phase = store.getState().phase
+        if (phase !== 'offline' && phase !== 'boot') {
+          e.preventDefault()
+          startNewConversation()
+        }
         return
       }
 
@@ -689,7 +837,9 @@ export default function App() {
       window.removeEventListener('keydown', onKey)
       clearIdle()
       if (voicePoll.current) clearInterval(voicePoll.current)
+      if (announcePoll.current) clearInterval(announcePoll.current)
       voice.current?.stop()
+      clapWake.current?.stop()
       speaker.current?.cancel()
       // The camera must not outlive the page that turned it on.
       hands.disableHands()

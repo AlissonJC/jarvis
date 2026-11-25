@@ -289,7 +289,8 @@ class ChromeLink {
   }
 }
 
-const link = new ChromeLink()
+/** Exported so a test can stand a fake browser in for it. */
+export const link = new ChromeLink()
 
 /** One browser call, for tests and diagnostics. */
 export const callBrowser = (name, args) => link.call(name, args)
@@ -559,21 +560,24 @@ function samePage(a, b) {
 }
 
 async function settle(tab, target) {
+  let last = null
   for (let i = 0; i < SETTLE_TRIES; i++) {
     let reply
     try {
       reply = await link.call('get_page_text', { tabId: tab, max_chars: 200 })
     } catch {
-      return // the browser went away; the caller's own error path will say so
+      return last // the browser went away; the caller's own error path will say so
     }
     const blocks = reply?.result?.content
     const text = Array.isArray(blocks)
       ? blocks.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('\n')
       : ''
     const at = /^URL:\s*(\S+)/m.exec(text)
-    if (at && samePage(at[1], target)) return
+    if (at) last = at[1]
+    if (at && samePage(at[1], target)) return at[1]
     await new Promise((r) => setTimeout(r, SETTLE_GAP_MS))
   }
+  return last
 }
 
 /** The tab to act on: the one named, the one we remember, or a fresh one. */
@@ -686,9 +690,29 @@ Prefer this over a screenshot when you want to know what a page says or what can
 be clicked. Use chrome_page_text instead when you only want the prose.`
 
 /**
- * @param {{ allowWrites: boolean }} options
+ * @param {{
+ *   allowWrites: boolean,
+ *   finalProblem?: (finalUrl: string, requestedUrl: string) => string | null,
+ * }} options  `finalProblem` judges where a navigation actually ended up, after redirects.
  */
-export function chromeServer({ allowWrites }) {
+export function chromeServer(options) {
+  return createSdkMcpServer({
+    name: 'jarvis_chrome',
+    version: '1.0.0',
+    instructions:
+      "The user's own Chrome, already signed in to everything they use. " +
+      'Reach for it when the answer is behind a login or has to be seen on a ' +
+      'real page. Reading is free; acting on a page is not, so say what you ' +
+      'are doing before you do anything that changes something.',
+    // Behind tool search the model would never think to look, and "open my
+    // GitHub notifications" would quietly become a web search instead.
+    alwaysLoad: true,
+    tools: chromeTools(options),
+  })
+}
+
+/** The tool definitions on their own, so the handlers can be exercised without a server. */
+export function chromeTools({ allowWrites, finalProblem = () => null }) {
   const tools = [
     tool(
       'chrome_status',
@@ -743,9 +767,33 @@ export function chromeServer({ allowWrites }) {
         // Do not hand back until the page is really there. Everything the model
         // does next — reading it, screenshotting it, answering about it — is
         // wrong if it runs against the document this one replaced.
-        const url = String(args.url ?? '')
-        if (/^https?:\/\//i.test(url)) {
-          await settle(await resolveTab(args.tabId), url)
+        const url = String(args.url ?? '').trim()
+        if (!/^(back|forward)$/i.test(url)) {
+          const target = /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : `https://${url}`
+          const tab = await resolveTab(args.tabId)
+          const landed = await settle(tab, target)
+          // Where did it end up? A site on the list can still send the browser
+          // on, by a redirect the address did not show. If it landed somewhere
+          // the user never allowed, go back and say so.
+          const problem = landed ? finalProblem(landed, target) : null
+          if (problem) {
+            try {
+              await forward('navigate')({ url: 'back', tabId: tab })
+            } catch {
+              /* the refusal below stands either way */
+            }
+            return {
+              isError: true,
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    `The page was not kept open: ${problem}. The browser was sent back. ` +
+                    'Tell the user that site is not allowed and do not try another way to reach it.',
+                },
+              ],
+            }
+          }
         } else {
           // back / forward: no target to compare against, so just let it breathe.
           await new Promise((r) => setTimeout(r, 700))
@@ -867,8 +915,10 @@ export function chromeServer({ allowWrites }) {
       tool(
         'chrome_click',
         'Click something on the page. Take the ref from chrome_read_page or ' +
-          'chrome_find rather than guessing coordinates. Say what you are ' +
-          'about to do before doing anything irreversible.',
+          'chrome_find rather than guessing coordinates. The first call only PROPOSES ' +
+          'the click and is refused: the system then announces it and shows it on the ' +
+          'screen, and the click happens only if the user\'s very next utterance is "pode ' +
+          'clicar" and you call this again with the same ref. End your answer after a refusal.',
         {
           ref: z.string().optional().catch(undefined).describe('A ref_N from chrome_read_page.'),
           coordinate: z
@@ -876,21 +926,32 @@ export function chromeServer({ allowWrites }) {
             .optional()
             .catch(undefined)
             .describe('[x, y] fallback when there is no ref.'),
+          why: z
+            .string()
+            .optional()
+            .catch(undefined)
+            .describe('In a few words, in Portuguese, what the element is and what the click does. The system reads it to the user.'),
           tabId,
         },
-        async (args) => forward('computer')({ action: 'left_click', ...args }),
+        // `why` is for the person (the system reads it out); the extension has no such field.
+        async ({ why: _why, ...args }) => forward('computer')({ action: 'left_click', ...args }),
       ),
 
       tool(
         'chrome_type',
-        'Type text into whatever is focused. Click the field first.',
+        'Type text into whatever is focused. Click the field first. Like a click, the ' +
+          'first call only PROPOSES it: the system reads the whole text to the user and ' +
+          'it is typed only if their very next utterance is "pode digitar" and you call ' +
+          'this again with the same text. Text of up to 300 characters.',
         { text: z.string(), tabId },
         async (args) => forward('computer')({ action: 'type', ...args }),
       ),
 
       tool(
         'chrome_key',
-        'Press a key or chord, e.g. "Return", "Escape", "cmd+a".',
+        'Press a key or chord that acts on the page, e.g. "Return", "Escape", "Tab", ' +
+          '"cmd+a". Chords that reach the browser itself (address bar, menus, tabs, ' +
+          'function keys other than F5) are refused.',
         { text: z.string().describe('The key to press.'), tabId },
         async (args) => forward('computer')({ action: 'key', ...args }),
       ),
@@ -898,7 +959,10 @@ export function chromeServer({ allowWrites }) {
       tool(
         'chrome_form_input',
         'Set the value of a form field directly — more reliable than typing ' +
-          'for selects, checkboxes and long values.',
+          'for selects, checkboxes and long values. Like a click, the first call only ' +
+          'PROPOSES it: the system reads the field and value to the user and it is set ' +
+          'only if their very next utterance is "pode preencher" and you call this again ' +
+          'with the same ref and value.',
         {
           ref: z.string().describe('A ref_N from chrome_read_page.'),
           value: z.union([z.string(), z.number(), z.boolean()]),
@@ -936,19 +1000,7 @@ export function chromeServer({ allowWrites }) {
     )
   }
 
-  return createSdkMcpServer({
-    name: 'jarvis_chrome',
-    version: '1.0.0',
-    instructions:
-      "The user's own Chrome, already signed in to everything they use. " +
-      'Reach for it when the answer is behind a login or has to be seen on a ' +
-      'real page. Reading is free; acting on a page is not, so say what you ' +
-      'are doing before you do anything that changes something.',
-    // Behind tool search the model would never think to look, and "open my
-    // GitHub notifications" would quietly become a web search instead.
-    alwaysLoad: true,
-    tools,
-  })
+  return tools
 }
 
 /** Whether the extension looks reachable, for the boot log. */

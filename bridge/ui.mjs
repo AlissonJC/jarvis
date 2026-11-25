@@ -85,6 +85,13 @@ const ok = (text) => ({ content: [{ type: 'text', text }] })
 const refuse = (text) => ({ isError: true, content: [{ type: 'text', text }] })
 
 /**
+ * An orbit's id is chosen by the model and answered back ("In orbit as …"), so it
+ * is kept to what an identifier needs: letters, digits, "-" and "_", 40 at most.
+ * A longer or odder one cannot carry an address.
+ */
+export const cleanId = (raw) => String(raw ?? '').replace(/[^A-Za-z0-9_-]+/g, '').slice(0, 40)
+
+/**
  * The phase list is the store's `Phase` union, and the notes are what each one
  * means on screen — the model is picking colours for states it never sees, so
  * naming the moment is worth more than naming the constant.
@@ -388,7 +395,7 @@ export function uiServer(emit) {
         }
 
         if (action === 'remove') {
-          const id = String(args.id ?? '').trim()
+          const id = cleanId(args.id)
           // Handed back rather than guessed at: removing "probably the last
           // one" is how an image the user was still looking at disappears.
           if (!id) {
@@ -425,7 +432,7 @@ export function uiServer(emit) {
         // objects at the same point on the ring.
         const angle = clamp(args.phase, -1e6, 1e6)
         const object = {
-          id: String(args.id ?? '').trim() || `o${Date.now().toString(36)}-${n.toString(36)}`,
+          id: cleanId(args.id) || `o${Date.now().toString(36)}-${n.toString(36)}`,
           src,
           radius: clamp(args.radius, 0.1, 1.2) ?? 0.55,
           speed: clamp(args.speed, -30, 30) ?? 4,

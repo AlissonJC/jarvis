@@ -261,7 +261,7 @@ function absolute(href, base) {
  * was furniture. Images are rewritten through /img so that even in reading mode
  * the browser never talks to the publisher.
  */
-function toReader(html, pageUrl, bridgeOrigin) {
+function toReader(html, pageUrl, imgSrc) {
   const clean = stripDangerous(html)
   const body = articleBody(clean)
   const title = titleOf(html)
@@ -289,7 +289,7 @@ function toReader(html, pageUrl, bridgeOrigin) {
       // URI here is almost always one of those rather than a photograph.
       if (abs && /^https?:/i.test(abs)) {
         blocks.push(
-          `<img class="rd-img" loading="lazy" src="${bridgeOrigin}/img?url=${encodeURIComponent(abs)}" alt="">`,
+          `<img class="rd-img" loading="lazy" src="${imgSrc(abs)}" alt="">`,
         )
       }
       continue
@@ -313,7 +313,7 @@ function toReader(html, pageUrl, bridgeOrigin) {
 
   const leadImg =
     lead && /^https?:/i.test(lead)
-      ? `<img class="rd-lead" src="${bridgeOrigin}/img?url=${encodeURIComponent(lead)}" alt="">`
+      ? `<img class="rd-lead" src="${imgSrc(lead)}" alt="">`
       : ''
 
   const host = (() => {
@@ -390,11 +390,15 @@ function toLive(html, pageUrl) {
  * @param {string} url
  * @param {'reader'|'live'} mode
  * @param {string} bridgeOrigin  e.g. http://localhost:8787
+ * @param {{ img?: (absoluteUrl: string) => string, checkHop?: (url: URL) => string | null }} [opts]
+ *   `img`: how an article image becomes a bridge URL; `checkHop`: asked about every redirect on the way
  */
-export async function renderPage(url, mode, bridgeOrigin) {
+export async function renderPage(url, mode, bridgeOrigin, { img, checkHop } = {}) {
+  const imgSrc = img ?? ((abs) => `${bridgeOrigin}/img?url=${encodeURIComponent(abs)}`)
   const page = await fetchText(url, {
     maxBytes: MAX_PAGE_BYTES,
     timeoutMs: PAGE_TIMEOUT_MS,
+    checkHop,
   })
   if (!/^text\/html|^application\/xhtml/.test(page.type)) {
     throw proxyError(415, `not a web page (got ${page.type || 'nothing'})`)
@@ -405,7 +409,7 @@ export async function renderPage(url, mode, bridgeOrigin) {
   const shim = `<script nonce="${nonce}">${SCROLL_SHIM}</script>`
   const rendered = live
     ? toLive(page.text, page.url)
-    : toReader(page.text, page.url, bridgeOrigin)
+    : toReader(page.text, page.url, imgSrc)
   // Appended rather than injected into <head>: by this point every other script
   // is gone, so there is nothing for it to race, and </body> is somewhere every
   // one of these documents actually has.
@@ -464,10 +468,10 @@ export async function renderPage(url, mode, bridgeOrigin) {
  * already on screen, whether the point was the picture or the argument. It is
  * here so the decision can be informed, not so it can be delegated.
  */
-export async function probeUrl(url) {
+export async function probeUrl(url, { checkHop, grant, io = { peek, fetchText } } = {}) {
   let head
   try {
-    head = await peek(url, { timeoutMs: PEEK_TIMEOUT_MS })
+    head = await io.peek(url, { timeoutMs: PEEK_TIMEOUT_MS, checkHop })
   } catch (err) {
     return {
       ok: false,
@@ -512,19 +516,26 @@ export async function probeUrl(url) {
   // It is a page, so find out whether there is an article in it worth reading
   // before promising one.
   try {
-    const full = await fetchText(head.url, {
+    const full = await io.fetchText(head.url, {
       maxBytes: MAX_PAGE_BYTES,
       timeoutMs: PAGE_TIMEOUT_MS,
+      checkHop,
     })
     const clean = stripDangerous(full.text)
     const readable = readableText(articleBody(clean))
     const title = titleOf(full.text)
-    const lead = metaContent(full.text, ['og:image', 'twitter:image'])
+    // Made absolute against the page it came from, and granted: this address was
+    // taken out of the page's own markup by the bridge, not written by a model, so
+    // the session may show it even after it has read private data (egress.mjs).
+    const rawLead = metaContent(full.text, ['og:image', 'twitter:image'])
+    const lead = rawLead ? absolute(rawLead, full.url) : null
+    const leadImage = lead && /^https?:/i.test(lead) ? lead : null
+    if (leadImage) grant?.(leadImage)
     return {
       ...base,
       title,
       readableChars: readable.length,
-      leadImage: lead || null,
+      leadImage,
       excerpt: readable.slice(0, 300),
       // Enough prose to be worth reading gets the reading view; a page that is
       // mostly interface — a dashboard, a search result, a video page — is only

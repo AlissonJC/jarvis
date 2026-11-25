@@ -22,6 +22,10 @@ export type Capabilities = {
   stt: boolean
   /** ElevenLabs text-to-speech is reachable via the bridge. */
   tts: boolean
+  /** Which engine the bridge speaks with, when `tts` is true. */
+  ttsEngine?: 'edge' | 'elevenlabs'
+  /** How long the bridge waits for one synthesis before giving up (ms). */
+  ttsTimeoutMs?: number
 }
 
 /** Browser-only until the probe says otherwise. Safe default: the app works. */
@@ -56,8 +60,19 @@ export async function probeCapabilities(): Promise<Capabilities> {
       signal: AbortSignal.timeout(3000),
     })
     if (res.ok) {
-      const h = (await res.json()) as { stt?: boolean; tts?: boolean }
-      current = { stt: Boolean(h.stt), tts: Boolean(h.tts) }
+      const h = (await res.json()) as {
+        stt?: boolean
+        tts?: boolean
+        ttsEngine?: string
+        ttsTimeoutMs?: number
+      }
+      current = {
+        stt: Boolean(h.stt),
+        tts: Boolean(h.tts),
+        ttsEngine: h.ttsEngine === 'edge' ? 'edge' : h.ttsEngine === 'elevenlabs' ? 'elevenlabs' : undefined,
+        ttsTimeoutMs:
+          typeof h.ttsTimeoutMs === 'number' && h.ttsTimeoutMs > 0 ? h.ttsTimeoutMs : undefined,
+      }
     }
   } catch {
     // Bridge down or slow — stay on the browser engines rather than blocking
@@ -70,6 +85,7 @@ export async function probeCapabilities(): Promise<Capabilities> {
 /** A short human label for the HUD: what voice stack is actually in play. */
 export function engineLabel(): string {
   const c = current
+  if (c.tts && c.ttsEngine === 'edge') return c.stt ? 'ElevenLabs STT + Brian' : 'Brian (edge-tts)'
   if (c.stt && c.tts) return 'ElevenLabs'
   if (c.tts) return 'ElevenLabs voice'
   // env.elevenKey is only meaningful in direct mode; harmless to mention.

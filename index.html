@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="pt-BR">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -38,12 +38,23 @@
       have been through the bridge — script-stripped, served under their own
       tight CSP, and sandboxed at the iframe — can be framed at all.
 
-      The rest is loose on purpose, because the voice stack needs it:
-      'wasm-unsafe-eval' and 'unsafe-eval' for the ONNX runtime and the inline
-      espeak-ng WASM, blob: workers for the wake-word engine and the speech
-      model, ws: for both the bridge and Vite's HMR socket, https: for the
-      model download and the speech API, and 'unsafe-inline' scripts for the
-      React Fast Refresh preamble Vite injects in dev.
+      The rest is as tight as the voice stack allows: 'wasm-unsafe-eval' for
+      the MediaPipe runtime and blob: workers for the speech model. Script
+      sources beyond that are filled in by vite.config.ts and depend on the
+      mode: 'unsafe-inline' only in dev (the React Fast Refresh preamble Vite
+      injects is inline; the built page has no inline script), 'unsafe-eval'
+      only when VITE_TTS_ENGINE=kokoro (the ONNX runtime and the inline
+      espeak-ng WASM need it).
+
+      connect-src used to carry a blanket https:, ws: and wss:, which let any
+      script in the page send anything to anywhere. It now names only the
+      bridge (http and ws), this origin, and what vite.config.ts adds: the
+      direct-API, Kokoro or browser-held ElevenLabs hosts when those are on,
+      plus Vite's own socket in dev. The MediaPipe runtime and both of its
+      models are served from this origin (scripts/start.mjs pins them by
+      SHA-256), so no model host appears here. Otherwise the ElevenLabs voice
+      and the transcription go through the bridge, so the browser never calls
+      them.
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -51,14 +62,14 @@
         default-src 'self';
         base-uri 'self';
         object-src 'none';
-        frame-src https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com http://localhost:8787 http://127.0.0.1:8787;
-        img-src 'self' data: blob: http://localhost:8787 http://127.0.0.1:8787;
-        script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' blob:;
+        frame-src https://www.youtube-nocookie.com https://www.youtube.com https://player.vimeo.com __BRIDGE_ORIGINS__;
+        img-src 'self' data: blob: __BRIDGE_ORIGINS__;
+        script-src 'self' __SCRIPT_EXTRA__ 'wasm-unsafe-eval' blob:;
         style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
         font-src 'self' data: https://fonts.gstatic.com;
-        connect-src 'self' data: blob: https: ws: wss: http://localhost:8787 http://127.0.0.1:8787;
+        connect-src 'self' data: blob: __BRIDGE_ORIGINS__ __CONNECT_EXTRA__;
         worker-src 'self' blob:;
-        media-src 'self' data: blob: http://localhost:8787 http://127.0.0.1:8787;
+        media-src 'self' data: blob: __BRIDGE_ORIGINS__;
       "
     />
 

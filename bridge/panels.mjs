@@ -60,8 +60,10 @@ PICTURES AND VIDEO — these work. Use them.
   - Video results are for playing, not describing. A YouTube or Vimeo result
     goes in an <iframe> inside .hud-embed; a direct .mp4 or .webm goes in a
     <video class="hud-video" controls>.
-  - Never invent a URL. Use only ones that appeared verbatim in a tool result.
-    A guessed address is a broken image, and a broken image is worse than none.
+  - Never invent a URL. Use only ones the user said, ones in the list of links a web
+    search returned, or the lead image probe_url reports. An address copied out of a
+    summary or a page's text, or assembled by you, may be refused once private data
+    has been read; a guessed one is a broken image, and a broken image is worse than none.
 
 WHERE THE CONTENT COMES FROM — read this before showing anything from the web.
   - Fetch with exa. crawling_exa and web_fetch_exa return the page's actual
@@ -267,8 +269,8 @@ const bladeSchema = {
     .optional()
     .catch(undefined)
     .describe(
-      'The address, for article / image / video / embed. Use a URL that ' +
-        'appeared verbatim in a tool result — never one you assembled yourself.',
+      'The address, for article / image / video / embed. Use one the user said, one ' +
+        'from a web search\'s list of links, or the lead image probe_url reports — never one you assembled yourself.',
     ),
   images: z
     .array(z.string())
@@ -332,7 +334,21 @@ const noCameraSchema = {
     .describe('What is being opened. See the tool description.'),
 }
 
-export function displayServer(emit, emitBlade, { camera = true } = {}) {
+/**
+ * `egressCheck(url)` is the one rule every outbound address answers to
+ * (egress.mjs): it returns a sentence when the bridge may not be made to fetch
+ * that address, and null when it may. The bridge enforces it again on the HTTP
+ * routes that do the fetching; asking here as well lets the model be told, so a
+ * refused picture does not just become an empty rectangle. `egressHop(start,
+ * hop)` is the same rule for a redirect the probe meets on the way, and
+ * `egressGrant(url)` records an address the bridge took out of a page it fetched
+ * (the lead image `probe_url` reports) as handed over, by code, to this session.
+ */
+export function displayServer(
+  emit,
+  emitBlade,
+  { camera = true, egressCheck = () => null, egressHop = () => null, egressGrant = () => {} } = {},
+) {
   return createSdkMcpServer({
     name: 'jarvis',
     version: '1.0.0',
@@ -383,7 +399,7 @@ export function displayServer(emit, emitBlade, { camera = true } = {}) {
          */
         emitBlade({
           id: `p${Date.now().toString(36)}-${(seq++).toString(36)}`,
-          title: String(args.title ?? '').trim() || 'DISPLAY',
+          title: cleanTitle(args.title),
           kind: 'markup',
           html: args.html,
           size: args.slot === 'wide' ? 'wide' : 'compact',
@@ -413,10 +429,19 @@ export function displayServer(emit, emitBlade, { camera = true } = {}) {
         if (['article', 'image', 'video', 'embed'].includes(kind) && !url) {
           return refuse(`Not opened: kind "${kind}" needs a \`url\`.`)
         }
+        // An embed is framed straight from its (allowlisted) host; everything
+        // else the bridge fetches, so it answers to the egress rule.
+        if (kind !== 'embed') {
+          const refused = [url, ...images]
+            .filter((u) => /^https?:\/\//i.test(String(u)))
+            .map((u) => egressCheck(String(u)))
+            .find(Boolean)
+          if (refused) return refuse(`Not opened: ${refused}. Use an address from the list of links a web search returned, the lead image probe_url reports, or one the user said.`)
+        }
 
         const blade = {
           id: `b${Date.now().toString(36)}-${(seq++).toString(36)}`,
-          title: String(args.title ?? '').trim() || 'DISPLAY',
+          title: cleanTitle(args.title),
           kind,
           url: url || undefined,
           images: images.length ? images.slice(0, 8) : undefined,
@@ -437,7 +462,13 @@ export function displayServer(emit, emitBlade, { camera = true } = {}) {
         PROBE_DESCRIPTION,
         { url: z.string().describe('The absolute URL to inspect.') },
         async (args) => {
-          const report = await probeUrl(String(args.url ?? ''))
+          const refused = egressCheck(String(args.url ?? ''))
+          if (refused) return refuse(`Not probed: ${refused}.`)
+          const start = String(args.url ?? '')
+          const report = await probeUrl(start, {
+            checkHop: (hop) => egressHop(start, hop.href ?? String(hop)),
+            grant: egressGrant,
+          })
           return { content: [{ type: 'text', text: JSON.stringify(report, null, 1) }] }
         },
       ),
@@ -446,3 +477,20 @@ export function displayServer(emit, emitBlade, { camera = true } = {}) {
 }
 
 const refuse = (text) => ({ isError: true, content: [{ type: 'text', text }] })
+
+/**
+ * A title is two to four words naming a blade, and the tool answers with it
+ * ("Open on the blades as …"), so it is an echo the model controls. It carries no
+ * address, no markup and no more than 48 characters, which is room for a name and
+ * not for anything composed out of private data.
+ */
+export function cleanTitle(raw) {
+  const t = String(raw ?? '')
+    .replace(/[\u0000-\u001f\u007f-\u009f<>]/g, ' ')
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S*|www\.\S*/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 48)
+    .trim()
+  return t || 'DISPLAY'
+}

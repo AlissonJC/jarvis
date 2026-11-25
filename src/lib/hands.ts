@@ -40,13 +40,14 @@ import { holdCamera, releaseCamera } from './camera'
 const WASM_BASE = '/mediapipe'
 
 /**
- * The weights stay remote, and that is a different call from the runtime above.
- * This is data, not code: it is fetched, so `connect-src` governs it rather
- * than `script-src`, and nothing in it executes. The browser caches it after
- * first use, exactly as the neural voice model is handled.
+ * The weights are served from here too. They used to be fetched from Google's
+ * storage bucket, which meant the page's `connect-src` had to name that host and
+ * so allowed a request to any file in any bucket on it. scripts/start.mjs now
+ * downloads the file once, checks it against a pinned SHA-256 (the same way it
+ * does the YAMNet model) and puts it in public/models. Without it, gestures stay
+ * off; nothing else depends on it.
  */
-const MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'
+const MODEL_URL = '/models/hand_landmarker.task'
 
 /* ------------------------------------------------------------------ anatomy */
 

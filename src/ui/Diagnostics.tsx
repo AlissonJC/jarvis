@@ -44,6 +44,27 @@ type TtsDiag = {
   lastText: string
 }
 
+type ClapDiag = {
+  state: string
+  error: string
+  threshold: number
+  kinds: string
+  onsets: number
+  classified: number
+  lastClass: string
+  lastScore: number
+  lastAt: number
+  lastKind: string
+  lastKindScore: number
+  lastOutcome: string
+  notClap: number
+  singles: number
+  wakes: number
+  muted: number
+  belowThreshold: number
+  inferMs: number
+}
+
 const ago = (t: number) => (t ? `${((Date.now() - t) / 1000).toFixed(1)}s ago` : '—')
 
 function Row({ k, v, bad }: { k: string; v: string; bad?: boolean }) {
@@ -84,6 +105,7 @@ export function Diagnostics() {
   const w = window as unknown as Record<string, unknown>
   const v = (w.__voice ?? {}) as Partial<VoiceDiag>
   const t = (w.__tts ?? {}) as Partial<TtsDiag>
+  const c = (w.__clapwake ?? {}) as Partial<ClapDiag>
 
   // The two verdicts worth stating outright, rather than making you infer them
   // from the numbers underneath.
@@ -118,6 +140,25 @@ export function Diagnostics() {
       <Row k="last heard" v={v.heard ? `"${v.heard}" ${ago(v.heardAt ?? 0)}` : '— nothing yet'} bad={!v.heard} />
       <Row k="last drop" v={v.dropped || '—'} bad={Boolean(v.dropped)} />
       <Row k="error" v={v.lastError || '—'} bad={Boolean(v.lastError)} />
+
+      <div className="diag-sec">CLAP / SNAP WAKE</div>
+      <Row
+        k="state"
+        v={c.state === 'failed' ? `FAILED: ${c.error}` : `${c.state ?? '—'} (${c.kinds ?? '—'}, score ≥ ${c.threshold ?? '—'})`}
+        bad={c.state === 'failed'}
+      />
+      <Row
+        k="last sound"
+        v={c.lastClass ? `${c.lastClass} ${(c.lastScore ?? 0).toFixed(2)} ${ago(c.lastAt ?? 0)}` : '— nothing yet'}
+      />
+      <Row
+        k="as clap/snap"
+        v={c.lastKind ? `${c.lastKind} ${(c.lastKindScore ?? 0).toFixed(2)} → ${c.lastOutcome}` : c.lastOutcome || '—'}
+      />
+      <Row k="single sounds" v={String(c.singles ?? 0)} />
+      <Row k="double wakes" v={String(c.wakes ?? 0)} />
+      <Row k="gated · classified" v={`${c.onsets ?? 0} · ${c.classified ?? 0} (${c.inferMs ?? 0} ms)`} />
+      <Row k="ignored" v={`${c.muted ?? 0} while speaking · ${c.belowThreshold ?? 0} below score · ${c.notClap ?? 0} other sound`} />
 
       <div className="diag-sec">SPEAKING · press T to test</div>
       <Row k="engine" v={String(t.engine ?? 'system')} />

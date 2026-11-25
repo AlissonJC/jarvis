@@ -6,16 +6,17 @@ import { BladeSweep, Blades } from './Blades'
 import { Effects } from './Effects'
 import { Pointer } from './Pointer'
 import { GestureGuide } from './GestureGuide'
+import { CALL_PHRASE, NAME_DOTTED, NAME_UPPER, TAGLINE } from '../lib/identity'
 
 const statusText: Record<Phase, string> = {
   offline: 'OFFLINE',
-  boot: 'INITIALISING',
-  dormant: 'STANDBY — SAY “HEY JARVIS”',
+  boot: 'INICIALIZANDO',
+  dormant: `EM ESPERA — DIGA “${CALL_PHRASE.toUpperCase()}”`,
   waking: 'ONLINE',
-  listening: 'LISTENING',
-  thinking: 'PROCESSING',
-  tooling: 'ACCESSING SYSTEMS',
-  speaking: 'RESPONDING',
+  listening: 'OUVINDO',
+  thinking: 'PROCESSANDO',
+  tooling: 'ACESSANDO SISTEMAS',
+  speaking: 'RESPONDENDO',
 }
 
 function Corner({ at }: { at: 'tl' | 'tr' | 'bl' | 'br' }) {
@@ -190,8 +191,8 @@ export function Hud() {
       <header className="hud-top">
         {ui.chrome.brand && (
           <div className="brand">
-            <span className="brand-mark">J.A.R.V.I.S.</span>
-            <span className="brand-sub">Just A Rather Very Intelligent System</span>
+            <span className="brand-mark">{NAME_DOTTED}.</span>
+            <span className="brand-sub">{TAGLINE}</span>
           </div>
         )}
 
@@ -273,7 +274,7 @@ export function Hud() {
                 exit={{ opacity: 0 }}
                 transition={{ type: 'spring', stiffness: 320, damping: 32 }}
               >
-                <span className="log-who">{t.role === 'user' ? 'YOU' : 'JARVIS'}</span>
+                <span className="log-who">{t.role === 'user' ? 'VOCÊ' : NAME_UPPER}</span>
                 {/* Only his half decodes. What the user said was never
                     transmitted from anywhere — dressing it up as machine
                     output would be a lie about where the words came from. */}
@@ -312,7 +313,7 @@ export function Hud() {
 
       <footer className="hud-bottom">
         <span className="hint">
-          say <b>“hey jarvis”</b> · <kbd>Space</kbd> to talk · <kbd>G</kbd> hands
+          diga <b>“{CALL_PHRASE}”</b> · <kbd>Espaço</kbd> para falar · <kbd>G</kbd> mãos
           {voice && (
             <>
               {' · '}

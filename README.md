@@ -51,6 +51,15 @@ npm start          # runs the brain and the face together
 
 Then open the URL it prints (http://localhost:5173) in **Chrome**, click **INITIALISE**, and say **“Hey Jarvis”**.
 
+For everyday use, run the **built** face instead of the Vite dev server (no hot-reload socket, a stricter content policy, and the per-start bridge token handed over by `scripts/serve.mjs` rather than inlined into a dev-server module):
+
+```bash
+npm run build
+npm start -- --built     # serves dist/ on http://localhost:4173 (or the first free port)
+```
+
+`npm start` picks the face's port and tells the bridge that exact origin; the bridge accepts the face from nowhere else (see `docs/SEGURANCA.md`).
+
 Prefer two terminals? Run them separately instead:
 
 ```bash

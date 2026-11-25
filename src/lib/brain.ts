@@ -3,6 +3,7 @@ import * as direct from './anthropic'
 import * as bridge from './bridge'
 import type { AskHandlers, Msg } from './anthropic'
 import type { Blade, Panel } from '../store'
+import type { Announcement } from './announce'
 
 export type { AskHandlers, Msg }
 export type { ConnectionState } from './bridge'
@@ -56,6 +57,17 @@ export function watchBlades(fn: (blade: Blade) => void): void {
   if (usingBridge) bridge.watchBlades(fn)
 }
 
+/** The assistant speaking first (reminders, the briefing, local scripts) is a
+ *  bridge capability: the direct path has no way to be told anything unasked. */
+export function watchAnnounce(fn: (a: Announcement) => void): void {
+  if (usingBridge) bridge.watchAnnounce(fn)
+}
+export const requestAnnouncePlay = (id: string): Promise<boolean> =>
+  usingBridge ? bridge.requestAnnouncePlay(id) : Promise.resolve(false)
+export function ackAnnounce(id: string, status: 'played' | 'interrupted'): void {
+  if (usingBridge) bridge.ackAnnounce(id, status)
+}
+
 /**
  * Redressing the interface — theme, reactor, orbiting objects, effects — is a
  * bridge capability, like panels. The `ui_*` tools live in an in-process MCP
@@ -98,6 +110,16 @@ export function cancel(): void {
 /** The older name for `cancel()`. */
 export function interrupt(): void {
   cancel()
+}
+
+/**
+ * A new conversation, on the user's request: on the bridge a fresh agent session
+ * (what it had read, and the caution that went with it, is gone); on the direct
+ * path the caller simply drops its history. Only ever called for the user's own
+ * words or keypress, never for anything a model said.
+ */
+export function newConversation(): void {
+  if (usingBridge) bridge.newConversation()
 }
 
 /**

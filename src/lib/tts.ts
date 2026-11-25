@@ -4,10 +4,14 @@ import {
   BACKEND,
   TTS_ENGINE,
   KOKORO_VOICE,
+  BRIDGE_AUTH_FIRST,
   BRIDGE_HTTP_URL,
 } from '../config'
 import * as kokoro from './kokoro'
 import { caps } from './capabilities'
+import { LOCALE, langFit } from './locale'
+import { splitFirstClause } from './chunking'
+import { createSpeechActivity } from './speechActivity'
 
 /**
  * Speech output.
@@ -62,7 +66,7 @@ const ECHO_TAIL_MS = 1800
  * indistinguishable. This tells them apart at a glance.
  */
 export const diag = {
-  engine: 'system' as 'system' | 'kokoro' | 'elevenlabs',
+  engine: 'system' as 'system' | 'kokoro' | 'elevenlabs' | 'edge',
   /** Utterances handed to an engine — the OS voice or an audio element. */
   spoken: 0,
   /**
@@ -104,6 +108,18 @@ if (typeof window !== 'undefined') {
 let nativeBroken = false
 
 let speakingAt = 0
+/** Text playing now plus sentences still owed; see speechActivity.ts. */
+const activity = createSpeechActivity()
+
+/**
+ * Is he speaking, and when did he last stop? The clap wake mutes itself on this
+ * (see clapwake.ts): a sound from his own speakers must never wake him.
+ */
+export function speechState(): { speaking: boolean; endedAt: number } {
+  // Still "speaking" while sentences are queued behind the one playing, so the
+  // gap between two of them is not a window for a clap to get through.
+  return activity.state()
+}
 
 /** When the current sentence started, or 0 if nothing is being spoken. The
  *  voice loop uses this to refuse to interrupt him in his own first syllable. */
@@ -115,6 +131,7 @@ function setSpeaking(text: string) {
   if (text) {
     speaking = text
     speakingAt = Date.now()
+    activity.setText(text)
     return
   }
   if (speaking) {
@@ -122,6 +139,7 @@ function setSpeaking(text: string) {
     recentUntil = Date.now() + ECHO_TAIL_MS
   }
   speaking = ''
+  activity.setText('')
 }
 
 /**
@@ -149,7 +167,7 @@ const SENTENCE_END = /([.!?]["'')\]”’]?\s)|(\n\n)/
 /** Full stops that are not sentence ends. Cutting on these puts an audible
  *  gap inside "Mr. Stark" and reads as a stutter. */
 const ABBREVIATION =
-  /(?:^|\s)(mr|mrs|ms|dr|prof|sr|jr|st|vs|etc|e\.g|i\.e|approx|inc|ltd|co|no|vol|fig|dept|est|min|max|hr|hrs|a\.m|p\.m|u\.s|u\.k|no)\.$/i
+  /(?:^|\s)(mr|mrs|ms|dr|prof|sr|jr|st|vs|etc|e\.g|i\.e|approx|inc|ltd|co|no|vol|fig|dept|est|min|max|hr|hrs|a\.m|p\.m|u\.s|u\.k|no|sra|srta|dra|av|ex|exmo|ilmo|pág|pag|tel|núm)\.$/i
 
 /**
  * Nobody punctuates forever, but a model occasionally writes a long clause
@@ -177,20 +195,34 @@ function score(v: SpeechSynthesisVoice): number {
   const n = v.name.toLowerCase()
   let s = 0
 
-  // The macOS British male, and the closest thing to the character available
-  // without leaving the machine.
-  if (n.startsWith('daniel')) s += 100
-  else if (n.includes('google uk english male')) s += 85
-  else if (/\b(oliver|arthur|jamie|malcolm)\b/.test(n)) s += 80
-  // Newer macOS en-GB male voices — casual, but serviceable.
-  else if (/\b(reed|rocko|eddy)\b/.test(n)) s += 40
+  if (LOCALE.lang === 'en') {
+    // The macOS British male, and the closest thing to the character available
+    // without leaving the machine.
+    if (n.startsWith('daniel')) s += 100
+    else if (n.includes('google uk english male')) s += 85
+    else if (/\b(oliver|arthur|jamie|malcolm)\b/.test(n)) s += 80
+    // Newer macOS en-GB male voices — casual, but serviceable.
+    else if (/\b(reed|rocko|eddy)\b/.test(n)) s += 40
+  } else if (LOCALE.lang === 'pt') {
+    // Portuguese: Chrome's own network voice is the best generally available;
+    // then the male names the OS engines ship. Any other pt voice is usable
+    // (this is only the fallback — the real voice comes from the bridge).
+    if (n.includes('google') && /portugu|portuguese/.test(n)) s += 85
+    else if (/\b(ant[oô]nio|felipe|ricardo|donato|humberto|fabio|fábio|valerio|valério)\b/.test(n)) s += 80
+    else s += 40
+  } else {
+    // Any other language: no taste to apply, any voice of it will do.
+    s += 40
+  }
 
   // Higher-quality variants of whatever matched above.
   if (n.includes('premium')) s += 30
   else if (n.includes('enhanced')) s += 20
 
-  if (/en[-_]gb/i.test(v.lang)) s += 25
-  else if (/^en/i.test(v.lang)) s += 5
+  // Same language and region beats same language, any other region.
+  const fit = langFit(v.lang)
+  if (fit === 2) s += 25
+  else if (fit === 1) s += 5
 
   // Voices that clearly aren't a butler.
   if (/grandma|grandpa|bubbles|jester|bells|boing|whisper|zarvox|superstar|trinoids|wobble|bahh|organ|cellos|bad news|good news/.test(n)) {
@@ -200,19 +232,25 @@ function score(v: SpeechSynthesisVoice): number {
   if (/\b(flo|sandy|shelley|kate|serena|fiona|moira|karen|tessa|samantha|zoe|allison|ava|susan)\b/.test(n)) {
     s -= 60
   }
+  // ...and the Portuguese ones. Still reachable as a fallback, just ranked last.
+  if (/\b(francisca|luciana|maria|thalita|giovanna|leila|brenda|yara|camila|fernanda|vit[oó]ria|raquel|helena|joana|catarina)\b/.test(n)) {
+    s -= 60
+  }
 
   return s
 }
 
-/** Only voices that scored on a name match, not merely on being English —
- *  otherwise the picker cycles through a dozen US novelty voices. */
+/** Only voices that scored on a name match, not merely on being of the
+ *  language — otherwise the English picker cycles through a dozen US novelty
+ *  voices. Every Portuguese voice clears it unless it is a female name or a
+ *  novelty voice. */
 const USABLE = 40
 
 /** Best-first list of usable voices — also what the voice picker cycles. */
 export function candidateVoices(): SpeechSynthesisVoice[] {
   return speechSynthesis
     .getVoices()
-    .filter((v) => /^en/i.test(v.lang))
+    .filter((v) => langFit(v.lang) > 0)
     .map((v) => ({ v, s: score(v) }))
     .filter((x) => x.s >= USABLE)
     .sort((a, b) => b.s - a.s)
@@ -236,7 +274,7 @@ function pickVoice(): SpeechSynthesisVoice | null {
     localStorage.removeItem(VOICE_PREF_KEY)
   }
 
-  cachedVoice = candidateVoices()[0] ?? all.find((v) => /^en/i.test(v.lang)) ?? null
+  cachedVoice = candidateVoices()[0] ?? all.find((v) => langFit(v.lang) > 0) ?? null
   return cachedVoice
 }
 
@@ -244,6 +282,7 @@ function pickVoice(): SpeechSynthesisVoice | null {
  *  always naming a speechSynthesis voice that a cloud or neural engine has
  *  quietly replaced. */
 export function currentVoiceName(): string {
+  if (caps().tts && caps().ttsEngine === 'edge') return 'Brian'
   if (USE_ELEVENLABS || caps().tts) return 'ElevenLabs'
   if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
     return KOKORO_VOICE.replace(/^bm_/, '')
@@ -320,10 +359,11 @@ function shape(text: string): string {
       .replace(/https?:\/\/[^\s]*[^\s.,;:!?)\]]/g, '')
       .replace(/[*_`#>]+/g, '')
       .replace(/^\s*[-•]\s+/gm, '')
-      // The vocative wants its comma — that small beat before "sir" does most
-      // of the characterisation. Anchored to a following pause or end of line
-      // so the honorific is left alone: "Sir Isaac Newton" is not a vocative.
-      .replace(/([^,\s])\s+(sir)(\s*[.,!?;:]|\s*$)/gi, '$1, $2$3')
+      // The vocative wants its comma — that small beat before "sir" ("senhor"
+      // in Portuguese) does most of the characterisation. Anchored to a
+      // following pause or end of line so the honorific is left alone: "Sir
+      // Isaac Newton" is not a vocative.
+      .replace(/([^,\s])\s+(sir|senhor)(\s*[.,!?;:]|\s*$)/gi, '$1, $2$3')
       .replace(/\s+/g, ' ')
       .trim()
   )
@@ -333,10 +373,13 @@ type Item = {
   text: string
   /** Generation starts one sentence ahead, not all at once. */
   audio?: Promise<string | null> | null
+  /** Counted in the speech activity until it is spoken, dropped or cancelled. */
+  owed?: boolean
 }
 
 export function createSpeaker(): Speaker {
   const queue: Item[] = []
+  let current: Item | null = null
   let buffer = ''
   let cancelled = false
   let outLevel = 0
@@ -352,6 +395,14 @@ export function createSpeaker(): Speaker {
     for (const r of waiting) r()
   }
 
+  /** Stop counting an item as owed. Safe to call twice. */
+  const release = (item: Item | null) => {
+    if (item?.owed) {
+      item.owed = false
+      activity.settle()
+    }
+  }
+
   const enqueue = (sentence: string, priority = false) => {
     if (cancelled) return
     // Shape once here so both engines get the same text — stripped markdown,
@@ -359,7 +410,8 @@ export function createSpeaker(): Speaker {
     const text = shape(sentence)
     if (!text) return
 
-    const item: Item = { text }
+    const item: Item = { text, owed: true }
+    activity.owe()
     if (priority) {
       // Genuinely ahead of the queue this time. The old `say()` appended to the
       // same chain and only appeared to preempt because it was called when the
@@ -384,7 +436,7 @@ export function createSpeaker(): Speaker {
       // for a session that had spoken every one of its sentences through
       // ElevenLabs, which makes the one field naming the engine useless
       // exactly when you are trying to work out which engine is at fault.
-      diag.engine = 'elevenlabs'
+      diag.engine = caps().ttsEngine === 'edge' ? 'edge' : 'elevenlabs'
       return fetchCloudAudio(text).catch(() => null)
     }
     if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
@@ -393,6 +445,25 @@ export function createSpeaker(): Speaker {
     }
     diag.engine = 'system'
     return null
+  }
+
+  /**
+   * Streamed text goes through here. The first sentence of an answer is cut at
+   * its first clause when it is long (see chunking.ts), so sound starts after a
+   * few words instead of after the whole sentence has been synthesised.
+   */
+  let firstSpoken = false
+  const enqueueStreamed = (sentence: string) => {
+    if (!firstSpoken) {
+      firstSpoken = true
+      const parts = splitFirstClause(sentence)
+      if (parts) {
+        enqueue(parts[0])
+        enqueue(parts[1])
+        return
+      }
+    }
+    enqueue(sentence)
   }
 
   /** Start generating an item's audio if it hasn't begun. */
@@ -415,7 +486,15 @@ export function createSpeaker(): Speaker {
         // generations against a single ONNX session.
         prime(queue[0])
 
-        await speakOne(item)
+        current = item
+        try {
+          await speakOne(item)
+        } finally {
+          // After speakOne's own setSpeaking(''), so the state never dips
+          // between two queued sentences: it ends when the last one is done.
+          release(item)
+          current = null
+        }
       }
     } finally {
       pumping = false
@@ -477,7 +556,7 @@ export function createSpeaker(): Speaker {
       const u = new SpeechSynthesisUtterance(text)
       const voice = pickVoice()
       if (voice) u.voice = voice
-      u.lang = voice?.lang ?? 'en-GB'
+      u.lang = voice?.lang ?? LOCALE.tag
       // Deliberate, and deliberately invariant — the character's pace does not
       // change with stakes, and that steadiness is most of the effect. This
       // lands around 130 wpm, below the median for film dialogue.
@@ -591,7 +670,8 @@ export function createSpeaker(): Speaker {
       // see the onplaying handler below.
       diag.spoken++
       diag.lastText = text.slice(0, 60)
-      diag.voice = diag.engine === 'kokoro' ? KOKORO_VOICE : 'ElevenLabs'
+      diag.voice =
+        diag.engine === 'kokoro' ? KOKORO_VOICE : diag.engine === 'edge' ? 'Brian' : 'ElevenLabs'
 
       let read: (() => number) | null = null
       const ctx = outputContext()
@@ -679,12 +759,22 @@ export function createSpeaker(): Speaker {
           // Re-scan from after this false boundary by folding it forward.
           const next = SENTENCE_END.exec(rest)!
           const wider = cut + next.index + next[0].length
-          enqueue(buffer.slice(0, wider))
+          enqueueStreamed(buffer.slice(0, wider))
           buffer = buffer.slice(wider)
           continue
         }
-        enqueue(candidate)
+        enqueueStreamed(candidate)
         buffer = buffer.slice(cut)
+      }
+
+      // A long first sentence still being written: speak its first clause now.
+      if (!firstSpoken) {
+        const parts = splitFirstClause(buffer)
+        if (parts) {
+          firstSpoken = true
+          enqueue(parts[0])
+          buffer = parts[1]
+        }
       }
 
       // Unpunctuated prose would otherwise sit here silently until the answer
@@ -692,14 +782,14 @@ export function createSpeaker(): Speaker {
       if (buffer.length > MAX_UNSPOKEN) {
         const cut = buffer.lastIndexOf(' ', MAX_UNSPOKEN)
         if (cut > 40) {
-          enqueue(buffer.slice(0, cut))
+          enqueueStreamed(buffer.slice(0, cut))
           buffer = buffer.slice(cut)
         }
       }
     },
     async end() {
       if (buffer.trim()) {
-        enqueue(buffer)
+        enqueueStreamed(buffer)
         buffer = ''
       }
       if (cancelled) return
@@ -710,6 +800,8 @@ export function createSpeaker(): Speaker {
       if (cancelled) return
       cancelled = true
       buffer = ''
+      for (const item of queue) release(item)
+      release(current)
       queue.length = 0
       // Keep the echo tail: the words already in the air still have to be
       // recognised and discarded, even though he has stopped adding to them.
@@ -738,13 +830,25 @@ export function createSpeaker(): Speaker {
 
 /** Only used when USE_ELEVENLABS is on. Bridge proxy first (it already holds
  *  the key), then a direct key, then null to fall back to the native voice. */
+/** Matches the bridge's default; the real value comes from /health. */
+const DEFAULT_TTS_TIMEOUT_MS = 15000
+/** How much longer than the bridge the face waits. */
+const CLIENT_MARGIN_MS = 3000
+
 async function fetchCloudAudio(text: string): Promise<string | null> {
   if (BACKEND === 'bridge') {
     try {
-      const res = await fetch(`${BRIDGE_HTTP_URL}/tts`, {
+      const res = await fetch(`${BRIDGE_HTTP_URL}/tts${BRIDGE_AUTH_FIRST}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ text }),
+        // The bridge gives up on its own after ttsTimeoutMs (JARVIS_TTS_TIMEOUT_MS,
+        // reported by /health; 15 s by default). This is the backstop that keeps
+        // a wedged bridge from stalling the sentence queue, so it must outlast
+        // the bridge's own limit — the server is the one that gives up first and
+        // answers with a clean error. On timeout the sentence drops to the
+        // browser voice.
+        signal: AbortSignal.timeout((caps().ttsTimeoutMs ?? DEFAULT_TTS_TIMEOUT_MS) + CLIENT_MARGIN_MS),
       })
       if (res.ok) return URL.createObjectURL(await res.blob())
     } catch {

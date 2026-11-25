@@ -1,3 +1,5 @@
+import { ASSISTANT_NAME } from './lib/identity'
+
 /**
  * JARVIS configuration.
  *
@@ -46,6 +48,35 @@ function flag(name: string, raw: unknown, fallback: boolean): boolean {
   return fallback
 }
 
+/** A number in a range; blank means the default, junk or out of range warns and uses it. */
+function num(name: string, raw: unknown, fallback: number, min: number, max: number): number {
+  const value = str(raw)
+  if (value === undefined) return fallback
+  const n = Number(value)
+  if (Number.isFinite(n) && n >= min && n <= max) return n
+  console.warn(`[jarvis] ${name}="${value}" is not a number from ${min} to ${max} — using ${fallback}.`)
+  return fallback
+}
+
+/**
+ * Wake by double clap or double finger snap, next to the voice wake word.
+ * See docs/PALMAS.md. None of these is a secret; all are optional.
+ *
+ *   VITE_CLAP_WAKE         on | off. Default on.
+ *   VITE_CLAP_KINDS        which sounds count: clap, snap or clap,snap. Default both.
+ *   VITE_CLAP_SENSITIVITY  YAMNet score a sound needs, 0.05 to 0.95. Default 0.35:
+ *                          below this the model is guessing; a deliberate clap
+ *                          or snap scores well above it. Lower hears more
+ *                          (and mistakes more), higher wants a clearer sound.
+ *   VITE_CLAP_WINDOW_MS    longest gap between the two sounds, 300 to 1500.
+ *                          Default 600. (They also have to be at least 150 ms
+ *                          apart, or it is one sound.)
+ */
+export const CLAP_WAKE = choice('VITE_CLAP_WAKE', import.meta.env.VITE_CLAP_WAKE, ['on', 'off'] as const, 'on') === 'on'
+export const CLAP_KINDS_RAW = str(import.meta.env.VITE_CLAP_KINDS)
+export const CLAP_SENSITIVITY = num('VITE_CLAP_SENSITIVITY', import.meta.env.VITE_CLAP_SENSITIVITY, 0.35, 0.05, 0.95)
+export const CLAP_WINDOW_MS = num('VITE_CLAP_WINDOW_MS', import.meta.env.VITE_CLAP_WINDOW_MS, 600, 300, 1500)
+
 /**
  * Which brain to use.
  *
@@ -73,6 +104,27 @@ export const BACKEND: 'bridge' | 'direct' = choice(
  */
 export const BRIDGE_WS_URL = str(import.meta.env.VITE_BRIDGE_URL) ?? 'ws://localhost:8787'
 export const BRIDGE_HTTP_URL = BRIDGE_WS_URL.replace(/^ws/, 'http')
+
+/**
+ * The per-start token the bridge asks for (bridge/server.mjs, docs/SEGURANCA.md).
+ * `npm start` generates one and gives the same value to both halves. It is not a
+ * secret from this browser: it is handed to the page. What it keeps out is every
+ * other site and program that can merely reach localhost.
+ *
+ * Two ways it arrives. In development Vite inlines `VITE_BRIDGE_TOKEN`. In the
+ * built face (the production way, docs/SEGURANCA.md) nothing is baked in: the
+ * static server (scripts/serve.mjs) answers `/jarvis-config.js` with the token of
+ * that run, which sets `__JARVIS__` before this module loads. Blank when the
+ * bridge was started alone, in which case the bridge does not ask for one.
+ */
+const served = (globalThis as { __JARVIS__?: { token?: unknown } }).__JARVIS__?.token
+export const BRIDGE_TOKEN = str(import.meta.env.VITE_BRIDGE_TOKEN) ?? (typeof served === 'string' ? served : '')
+
+/** `&t=…` to append to a bridge URL that already has a query string. */
+export const BRIDGE_AUTH = BRIDGE_TOKEN ? `&t=${encodeURIComponent(BRIDGE_TOKEN)}` : ''
+
+/** `?t=…` for a bridge URL that has none (`/tts`, `/stt`). */
+export const BRIDGE_AUTH_FIRST = BRIDGE_TOKEN ? `?t=${encodeURIComponent(BRIDGE_TOKEN)}` : ''
 
 /**
  * Speech output engine.
@@ -276,29 +328,30 @@ export const activeServers = () => MCP_SERVERS.filter((s) => s.enabled && s.url)
  * fuller version in bridge/server.mjs — that's the one that gets used by
  * default, and the one worth editing.
  */
-export const SYSTEM_PROMPT = `You are JARVIS, Tony Stark's assistant. You are speaking out loud.
+export const SYSTEM_PROMPT = `Você é ${ASSISTANT_NAME.toUpperCase()}, o assistente pessoal. Você fala em voz alta, sempre em português do Brasil.
 
-THE HARD RULE: your entire reply must be under 60 words. This is not a style
-preference — every word is read aloud by a speech synthesiser and the user is
-waiting in silence while it plays. A four-paragraph answer is a failure, however
-good the content. If a question genuinely needs more, give the headline in two
-sentences and offer the detail: "There's more if you want it."
+REGRA DURA: sua resposta inteira deve ter menos de 40 palavras. Não é questão de
+estilo: cada palavra é lida em voz alta por um sintetizador e o usuário espera em
+silêncio enquanto ela toca. Uma resposta de quatro parágrafos é uma falha, por
+melhor que seja o conteúdo. Se a pergunta realmente exigir mais, dê a manchete em
+duas frases e ofereça o detalhe: "Há mais, se o senhor quiser."
 
-Voice:
-- Dry, precise, quietly amused. Understated competence, never fawning.
-- Say "sir" at most once per exchange, and not in every exchange.
-- Plain spoken prose only. No markdown, no bullet points, no headings, no code,
-  no emoji, no asterisks, no numbered lists.
-- Write numbers, dates and times the way you'd say them: "eight fifteen",
-  "the first of August", not "8:15" or "2026-08-01".
+Voz:
+- Seco, preciso, discretamente divertido. Competência discreta, nunca bajulador.
+- Diga "senhor" no máximo uma vez por resposta, e nem em toda resposta.
+- Responda sempre em português do Brasil, mesmo quando as fontes estiverem em inglês.
+- Apenas prosa falada. Sem markdown, sem listas, sem títulos, sem código, sem
+  emoji, sem asteriscos, sem listas numeradas.
+- Escreva números, datas e horas como se diz: "oito e quinze", "primeiro de
+  agosto", nunca "8:15" ou "2026-08-01".
 
-Using tools:
-- You have live tools. Use them rather than guessing.
-- Never narrate that you're about to use one. No "Let me search for that" or
-  "I'll check that now" — go silent, use it, then answer. The user sees a
-  spinner; they don't need commentary.
-- Never speak a URL, ID or raw JSON aloud unless asked. Summarise.
-- If a tool fails or isn't connected, one plain sentence saying so.
-- For anything outward-facing or destructive (sending mail, posting, paying,
-  deleting) say exactly what you're about to do and wait for confirmation.
-- If you don't know, say you don't know.`
+Uso de ferramentas:
+- Você tem ferramentas ao vivo. Use-as em vez de adivinhar.
+- Nunca narre que vai usar uma. Nada de "vou pesquisar isso" nem "deixa eu
+  ver": fique em silêncio, use a ferramenta e depois responda. O usuário vê um
+  indicador de carregamento; não precisa de comentário.
+- Nunca fale uma URL, ID ou JSON bruto em voz alta, a menos que peçam. Resuma.
+- Se uma ferramenta falhar ou não estiver conectada, diga isso em uma frase simples.
+- Para qualquer coisa voltada ao exterior ou destrutiva (enviar e-mail, publicar,
+  pagar, apagar), diga exatamente o que vai fazer e espere confirmação.
+- Se não souber, diga que não sabe.`

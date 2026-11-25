@@ -1,8 +1,10 @@
-import { BRIDGE_HTTP_URL } from '../config'
+import { BRIDGE_AUTH_FIRST, BRIDGE_HTTP_URL } from '../config'
 import { getMic } from './audio'
 import { speakingNow, speakingSince } from './tts'
 import { startVad, type Vad } from './vad'
 import { caps } from './capabilities'
+import { LOCALE } from './locale'
+import { WAKE, isSpokenInterrupt, isUserInterrupt } from './identity'
 
 /**
  * The voice loop.
@@ -64,22 +66,23 @@ export type Voice = {
 /** One utterance often produces several partials containing his name. */
 const WAKE_DEBOUNCE = 1500
 
-/**
- * His name, and the only wake phrase.
+/*
+ * His name, and the only wake phrase (the regex itself is `WAKE`, imported
+ * from identity.ts).
  *
- * The optional prefix is genuinely optional: addressing him by name alone is
- * correct, and during an answer "Jarvis" on its own is the natural way to cut
- * in. The negative lookahead keeps possessives ("Jarvis's job") from waking him.
+ * Built from the configured name and its spellings (see identity.ts and
+ * wake.ts): an optional greeting in English or Portuguese ("hey", "ei", "oi",
+ * "olá", "ok"), then the name or one of the ways a recogniser mishears it. The
+ * greeting is genuinely optional: addressing him by name alone is correct, and
+ * during an answer his name on its own is the natural way to cut in. Possessives
+ * ("Jarvis's job") do not wake him.
  *
- * The alternates are not padding. "Jarvis" is not in a general dictation
- * model's high-frequency vocabulary, and Chrome routinely returns Travis,
- * Jervis, Jarvys or Java's for a perfectly clear utterance — every one of which
- * used to be silently discarded, so the wake word "just didn't work" with no
- * indication why. Better a rare false wake than a name that does not answer.
+ * The alternates are not padding. The name is not in a dictation model's
+ * high-frequency vocabulary, and a pt-BR recogniser routinely returns Jarves,
+ * Jarbas or Travis for a perfectly clear utterance — every one of which used to
+ * be silently discarded, so the wake word "just didn't work" with no indication
+ * why. Better a rare false wake than a name that does not answer.
  */
-const WAKE =
-  /\b(?:hey|hi|ok|okay|yo)?\s*(?:jarvis|jarvys|jervis|jarvis's|travis|jarviss|java's|jarv)\b(?!'s)/i
-
 /** Everything after the wake phrase, which is usually the actual command. */
 function afterWake(text: string): string {
   const m = WAKE.exec(text)
@@ -124,6 +127,11 @@ function afterWake(text: string): string {
  */
 const CONTINUES =
   /\b(and|or|but|so|because|since|if|when|while|that|which|who|whose|to|of|in|on|at|by|for|with|from|about|into|onto|over|under|between|through|the|a|an|my|your|his|her|its|our|their|is|are|was|were|be|been|do|does|did|have|has|had|can|could|would|should|will|shall|might|must|like|than|then|as|very|really|just|some|any|all|both|either|neither)$/i
+
+/** The same, for Portuguese. Whole-word match on the last word, accent-blind
+ *  (a recogniser may or may not write the accent). */
+const CONTINUES_PT =
+  /^(e|ou|mas|porque|pois|que|se|quando|enquanto|como|de|do|da|dos|das|em|no|na|nos|nas|por|pelo|pela|para|pra|com|sem|sobre|entre|at[eé]|ate|desde|o|a|os|as|um|uma|uns|umas|meu|minha|seu|sua|dele|dela|[eé]|s[aã]o|sao|foi|era|ser|estar|est[aá]|esta|tem|t[eê]m|ter|vai|vou|pode|poderia|deveria|mais|menos|muito|tamb[eé]m|tambem|ent[aã]o|entao|ainda|j[aá]|ja)$/i
 
 /** Trailing punctuation a transcriber emits mid-thought. */
 const TRAILS = /[,;:–—-]$/
@@ -173,9 +181,10 @@ function holdFor(text: string): number {
   if (/[.!?]$/.test(text)) return 0
   if (TRAILS.test(text.trim())) return CONTINUE_MS
   if (CONTINUES.test(words[words.length - 1])) return CONTINUE_MS
+  if (CONTINUES_PT.test(words[words.length - 1])) return CONTINUE_MS
   // One or two words is usually the start of something, not the whole of it —
   // except for the short commands that genuinely are complete.
-  if (words.length <= 2 && !OVERRIDE.test(text)) return CONTINUE_MS
+  if (words.length <= 2 && !isSpokenInterrupt(text)) return CONTINUE_MS
   return SETTLE_MS
 }
 
@@ -257,18 +266,24 @@ function makeAssembler(h: {
 const norm = (s: string) =>
   s
     .toLowerCase()
+    // Fold accents ("não" -> "nao") before the strip below, or every accented
+    // letter would cut its word in two and Portuguese would never match itself.
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9' ]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 
-/**
+/*
  * Short words that must always cut through, even when they collide with what
  * he happens to be saying. Suppressing "stop" because he just said "stop"
  * would be the single most infuriating failure this file could have.
+ *
+ * English and Portuguese ("pare", "espera", "cancela", "chega", "silêncio",
+ * "cala a boca", "já chega") and the assistant's own name: see
+ * `isSpokenInterrupt` in wake.ts. Words that are also everyday Portuguese
+ * ("para", "no", "não") only count when they are nearly the whole utterance.
  */
-const OVERRIDE =
-  /\b(stop|wait|jarvis|cancel|enough|quiet|hold on|shut up|never ?mind|forget it|no)\b/i
-
 /**
  * Words too common to be evidence of anything.
  *
@@ -284,7 +299,13 @@ const STOP = new Set(
     'our their what which who how why when where do does did can could would ' +
     'should will shall not no yes if then than as about into over under out up ' +
     'down one two three first second third now here there just very really got ' +
-    'get have has had say said tell me okay ok well right').split(' '),
+    'get have has had say said tell me okay ok well right ' +
+    // Portuguese function words, accent-folded like norm() leaves them.
+    'o a os as um uma uns umas e ou mas que se de do da dos das em no na nos nas ' +
+    'por pelo pela para pra com sem sobre entre ate ao aos eu voce ele ela nos ' +
+    'eles elas meu minha seu sua isso isto esse essa este esta aquele aquela ' +
+    'qual quais quem como porque quando onde nao sim ser estar foi era sao tem ' +
+    'ter vai vou pode mais menos muito ja aqui ali la so ai').split(' '),
 )
 
 /**
@@ -296,7 +317,10 @@ const STOP = new Set(
  */
 function isEcho(heard: string, spoken: string): boolean {
   if (!spoken) return false
-  if (OVERRIDE.test(heard)) return false
+  // A stop word must cut through whatever he is saying — unless the words are
+  // simply his own, heard back through the speakers ("Não encontrei.", "Para o
+  // senhor.", his own name). Then it is the echo, whatever it sounds like.
+  if (isSpokenInterrupt(heard)) return !isUserInterrupt(heard, spoken)
 
   const all = norm(heard).split(' ').filter(Boolean)
   if (!all.length) return true
@@ -450,7 +474,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     if (mode === 'deaf') return
     const t0 = performance.now()
     try {
-      const res = await fetch(`${BRIDGE_HTTP_URL}/stt`, {
+      const res = await fetch(`${BRIDGE_HTTP_URL}/stt${BRIDGE_AUTH_FIRST}`, {
         method: 'POST',
         headers: { 'content-type': blob.type || 'audio/webm' },
         body: blob,
@@ -726,7 +750,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
       if (mode === 'guard') {
         // An override word cuts through everything below it — "stop" has to
         // work on the first syllable or it is not a stop button.
-        if (!OVERRIDE.test(full)) {
+        if (!isUserInterrupt(full, speakingNow())) {
           // His own first syllable, same as the premium path. This engine has
           // no energy gate, so without the clock the only defence is the word
           // count below, and a single clear word is exactly what leaks first.
@@ -760,7 +784,7 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     rec = new Ctor()
     rec.continuous = true
     rec.interimResults = true
-    rec.lang = 'en-GB'
+    rec.lang = LOCALE.tag
     rec.onstart = () => {
       running = true
       diag.running = true

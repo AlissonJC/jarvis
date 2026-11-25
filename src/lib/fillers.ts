@@ -8,44 +8,49 @@
  * The phrasing follows the character's actual grammar rather than generic
  * assistant-speak, which matters more than it sounds:
  *
- *   - Working lines are subjectless present participles: "Compiling.",
- *     "Cross-referencing." Not "I'm now checking" and never "let me".
- *   - There is no snap-to compliance formula. "Right away" and "At once" are
- *     not in his vocabulary; acknowledgement is deferential, not eager.
+ *   - Working lines are subjectless gerunds: "Compilando.", "Cruzando as
+ *     informações." Not "estou verificando" and never "deixa eu ver".
+ *   - There is no snap-to compliance formula. Acknowledgement is deferential,
+ *     not eager.
  *   - No filler words, no enthusiasm, no apology, no exclamation marks.
- *   - "Sir" fronted means urgency; final means routine. These are all routine,
- *     so it goes at the end, and only sometimes.
+ *   - "Senhor" fronted means urgency; final means routine. These are all
+ *     routine, so it goes at the end, and only sometimes.
+ *
+ * Portuguese (pt-BR). Every line below is pre-generated into the bridge's audio
+ * cache at start (`allLines()`, read by server.mjs), so the first one after a
+ * tool fires plays with no synthesis wait. Lines must survive `shape()` in
+ * tts.ts unchanged, or the cached audio is keyed under different text.
  */
 
 /** Said as soon as the first tool fires, before any answer exists. */
-const WORKING = [
-  'Working on it, sir.',
-  'Compiling.',
-  'Retrieving.',
-  'Accessing the archive.',
-  'Cross-referencing.',
-  'Running the query now.',
-  'Searching.',
-  'Under way.',
+export const WORKING = [
+  'Em andamento, senhor.',
+  'Compilando.',
+  'Recuperando.',
+  'Acessando o arquivo.',
+  'Cruzando as informações.',
+  'Executando a consulta.',
+  'Buscando.',
+  'Em curso.',
 ]
 
 /** Acknowledging an order where no tool is involved. */
-const ACKNOWLEDGE = [
-  'As you wish, sir.',
-  'Very good, sir.',
-  'Certainly.',
-  'Understood.',
-  'Consider it done.',
-  'Directly, sir.',
+export const ACKNOWLEDGE = [
+  'Como desejar, senhor.',
+  'Muito bem, senhor.',
+  'Certamente.',
+  'Entendido.',
+  'Considere feito.',
+  'Imediatamente, senhor.',
 ]
 
 /** Answering to his name, before the user has said what they want. */
-const ATTENTION = [
-  'Yes, sir?',
-  'Sir?',
-  'At your service, sir.',
-  'Standing by.',
-  'Awake, sir.',
+export const ATTENTION = [
+  'Pois não, senhor?',
+  'Senhor?',
+  'À sua disposição, senhor.',
+  'Aguardando.',
+  'Desperto, senhor.',
 ]
 
 /**
@@ -91,9 +96,10 @@ type Rule = {
   lines: string[]
 }
 
-const FOOTAGE = ['Assembling the footage.', 'Rendering the sequence.']
+/** Also pre-generated into the bridge's audio cache. */
+export const FOOTAGE = ['Montando as imagens.', 'Renderizando a sequência.']
 
-const BY_TOOL: Rule[] = [
+export const BY_TOOL: Rule[] = [
   // Video sits above image because higgsfield and palmier both do either, so
   // the verb in the tool name is the only thing separating them — a rule on the
   // server alone would send every generate_video to "Rendering."
@@ -101,50 +107,50 @@ const BY_TOOL: Rule[] = [
   {
     server: /higgsfield|openrouter-image|dalle|flux|midjourney/,
     tool: /image|photo|thumbnail|render|upscale|seedream/,
-    lines: ['Rendering.', 'Composing it now.'],
+    lines: ['Renderizando.', 'Compondo agora.'],
   },
   // The editors, once the two rules that read the verb have had their turn.
   { server: /palmier|heygen|runway|descript/, lines: FOOTAGE },
   {
     server: /playwright|puppeteer|browserbase|chrome/,
     tool: /\bbrowser\b|navigate/,
-    lines: ['Opening the browser.', 'Navigating.'],
+    lines: ['Abrindo o navegador.', 'Navegando.'],
   },
   {
     server: /android|\badb\b|simulator/,
     tool: /\bdevice\b|\bapk\b|\bphone\b/,
-    lines: ['Reaching the device.', 'Connecting to your phone.'],
+    lines: ['Alcançando o dispositivo.', 'Conectando ao seu celular.'],
   },
   {
     server: /gmail|\bmail\b/,
     tool: /gmail|\bmail\b|email|inbox/,
-    lines: ['Checking your mail.', 'Reading the inbox.'],
+    lines: ['Verificando o seu e-mail.', 'Lendo a caixa de entrada.'],
   },
   // Calendar keys off "calendar" alone. "event" used to live here, which is how
   // a Mixpanel event query came out as "Checking your calendar."
   {
     tool: /calendar|\bdiary\b|\bmeeting\b/,
-    lines: ['Checking your calendar.', 'Consulting the diary.'],
+    lines: ['Verificando a sua agenda.', 'Consultando a agenda.'],
   },
   {
     server: /elevenlabs|openai-tts/,
     tool: /speech|\bvoice\b|\btts\b|text_to_sound/,
-    lines: ['Synthesising.', 'Working on it, sir.'],
+    lines: ['Sintetizando.', 'Em andamento, senhor.'],
   },
   {
     server: /spotify|sonos/,
     tool: /\bplay\b|\bmusic\b|playlist|\btrack\b/,
-    lines: ['Queuing it up.', 'Putting it on.'],
+    lines: ['Preparando a fila.', 'Colocando para tocar.'],
   },
   {
     server: /^home|homeassistant|\bhue\b|\bhass\b/,
     tool: /\blights?\b|thermostat|\bdimmer\b/,
-    lines: ['Adjusting it now.', 'Seeing to it, sir.'],
+    lines: ['Ajustando agora.', 'Cuidando disso, senhor.'],
   },
   {
     server: /github|linear|jira|sentry/,
     tool: /\brepo\b|repository|\bissues?\b|pull_request|\bcommit\b/,
-    lines: ['Checking the repository.', 'Consulting the tracker.'],
+    lines: ['Verificando o repositório.', 'Consultando o rastreador.'],
   },
   // Also where the anonymously named analytics servers land — theirs are bare
   // UUIDs, so only the tool half says anything: Get-Report, Get-Events,
@@ -153,16 +159,28 @@ const BY_TOOL: Rule[] = [
   {
     server: /mixpanel|clarity|posthog|amplitude/,
     tool: /analytic|\bmetrics?\b|\breports?\b|\bevents?\b|cohort|funnel|dashboard|\bquery\b/,
-    lines: ['Running the query.', 'Pulling the figures.'],
+    lines: ['Executando a consulta.', 'Levantando os números.'],
   },
   {
     server: /\bexa\b|serper|serpapi|perplexity|tavily|brave/,
     tool: /search|\bweb\b|\bfetch\b|crawl|research/,
-    lines: ['Searching.', 'Consulting the record.'],
+    lines: ['Buscando.', 'Consultando o registro.'],
   },
 ]
 
 const pickers = BY_TOOL.map((r) => ({ ...r, pick: makePicker(r.lines) }))
+
+/** Every canned line, once — what the bridge pre-generates at start. */
+export function allLines(): string[] {
+  return [
+    ...new Set([
+      ...WORKING,
+      ...ACKNOWLEDGE,
+      ...ATTENTION,
+      ...BY_TOOL.flatMap((r) => r.lines),
+    ]),
+  ]
+}
 
 /**
  * `mcp__<server>__<tool>`, split on the first separator so tool names keep
